@@ -1,0 +1,166 @@
+import hashlib, json, time
+from typing import List, Dict, Set
+
+# ---------- Domain Models ----------
+class MedicalEvent:
+    def __init__(self, patient_id, provider_id, event_type, details, ts=None):
+        self.patient_id = patient_id
+        self.provider_id = provider_id
+        self.event_type = event_type  # "VISIT","LAB","RX","NOTE"
+        self.details = details        # freeform or minimal PII
+        self.timestamp = ts or int(time.time())
+
+    def to_dict(self):
+        return {
+            "patient_id": self.patient_id,
+            "provider_id": self.provider_id,
+            "event_type": self.event_type,
+            "details": self.details,
+            "timestamp": self.timestamp,
+        }
+
+class Block:
+    def __init__(self, index, previous_hash, events: List[MedicalEvent], nonce=0, ts=None):
+        self.index = index
+        self.previous_hash = previous_hash
+        self.timestamp = ts or int(time.time())
+        self.events = events
+        self.nonce = nonce
+        self.hash = self.calculate_hash()
+
+    def calculate_hash(self):
+        body = {
+            "index": self.index,
+            "previous_hash": self.previous_hash,
+            "timestamp": self.timestamp,
+            "events": [e.to_dict() for e in self.events],
+            "nonce": self.nonce
+        }
+        return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+    def mine(self, difficulty: int):
+        prefix = "0" * difficulty
+        while not self.hash.startswith(prefix):
+            self.nonce += 1
+            self.hash = self.calculate_hash()
+
+class HealthChain:
+    def __init__(self, difficulty=3):
+        self.chain: List[Block] = [self._genesis()]
+        self.difficulty = difficulty
+        self.pending_events: List[MedicalEvent] = []
+        # consent: patient -> set of providers allowed to write/view
+        self.consent_write: Dict[str, Set[str]] = {}
+        self.consent_view: Dict[str, Set[str]] = {}
+        # simple audit: (who, patient, action, ts)
+        self.audit_log: List[Dict] = []
+
+    def _genesis(self):
+        return Block(0, "0", [MedicalEvent("GENESIS","SYSTEM","INIT","Chain start")], nonce=0, ts=int(time.time()))
+
+    # ---------- Consent ----------
+    def grant_write(self, patient_id: str, provider_id: str):
+        self.consent_write.setdefault(patient_id, set()).add(provider_id)
+        self._audit("SYSTEM", patient_id, f"GRANT_WRITE:{provider_id}")
+
+    def revoke_write(self, patient_id: str, provider_id: str):
+        self.consent_write.setdefault(patient_id, set()).discard(provider_id)
+        self._audit("SYSTEM", patient_id, f"REVOKE_WRITE:{provider_id}")
+
+    def grant_view(self, patient_id: str, entity_id: str):
+        self.consent_view.setdefault(patient_id, set()).add(entity_id)
+        self._audit("SYSTEM", patient_id, f"GRANT_VIEW:{entity_id}")
+
+    def revoke_view(self, patient_id: str, entity_id: str):
+        self.consent_view.setdefault(patient_id, set()).discard(entity_id)
+        self._audit("SYSTEM", patient_id, f"REVOKE_VIEW:{entity_id}")
+
+    # ---------- Events ----------
+    def add_event(self, event: MedicalEvent):
+        # enforce write consent except for SYSTEM
+        if event.provider_id != "SYSTEM":
+            allowed = self.consent_write.get(event.patient_id, set())
+            if event.provider_id not in allowed:
+                raise PermissionError(f"Provider {event.provider_id} not allowed to write for patient {event.patient_id}")
+        self.pending_events.append(event)
+
+    def mine_pending(self, miner_id="MINER"):
+        block = Block(len(self.chain), self.chain[-1].hash, self.pending_events)
+        block.mine(self.difficulty)
+        self.chain.append(block)
+        self.pending_events = []  # clear mempool
+        self._audit(miner_id, "ALL", f"MINED_BLOCK#{block.index}:{block.hash}")
+        return block
+
+    # ---------- Query ----------
+    def get_patient_events(self, requester_id: str, patient_id: str) -> List[MedicalEvent]:
+        # view consent: patient may allow requester; SYSTEM/MINER bypass for demo
+        if requester_id not in {"SYSTEM", "MINER"}:
+            allowed = self.consent_view.get(patient_id, set())
+            if requester_id not in allowed and requester_id != patient_id:
+                self._audit(requester_id, patient_id, "DENIED_VIEW")
+                raise PermissionError(f"{requester_id} not allowed to view {patient_id}")
+        result = []
+        for block in self.chain:
+            for e in block.events:
+                if e.patient_id == patient_id:
+                    result.append(e)
+        self._audit(requester_id, patient_id, f"VIEWED_{len(result)}_EVENTS")
+        return result
+
+    # ---------- Integrity ----------
+    def is_valid(self) -> bool:
+        for i in range(1, len(self.chain)):
+            cur = self.chain[i]
+            prev = self.chain[i-1]
+            if cur.hash != cur.calculate_hash(): return False
+            if cur.previous_hash != prev.hash:   return False
+            if not cur.hash.startswith("0"*self.difficulty): return False
+        return True
+
+    def _audit(self, who, patient, action):
+        self.audit_log.append({
+            "who": who, "patient": patient, "action": action, "ts": int(time.time())
+        })
+
+# ---------- DEMO ----------
+if __name__ == "__main__":
+    hc = HealthChain(difficulty=3)
+
+    # Patient P1 gives Dr.A write + view; gives LabX view
+    hc.grant_write("P1", "Dr.A")
+    hc.grant_view("P1", "Dr.A")
+    hc.grant_view("P1", "LabX")
+
+    # Dr.A records a visit and prescription for P1
+    hc.add_event(MedicalEvent("P1","Dr.A","VISIT","Fever; Dx: Viral; Temp=38.5C"))
+    hc.add_event(MedicalEvent("P1","Dr.A","RX","Paracetamol 500mg TID x3d"))
+
+    # Mine them into a block
+    b1 = hc.mine_pending("Miner1")
+    print("Mined block:", b1.index, b1.hash)
+
+    # Attempt unauthorized write (should raise)
+    try:
+        hc.add_event(MedicalEvent("P1","Dr.B","NOTE","Hello"))
+    except PermissionError as e:
+        print("Write blocked:", e)
+
+    # Patient later allows LabX to write (e.g., lab result)
+    hc.grant_write("P1","LabX")
+    hc.add_event(MedicalEvent("P1","LabX","LAB","CBC: WBC=6.0, Hgb=13.2"))
+    b2 = hc.mine_pending("Miner1")
+    print("Mined block:", b2.index, b2.hash)
+
+    # Authorized reads
+    events_for_drA = hc.get_patient_events("Dr.A","P1")
+    print("Dr.A can view", len(events_for_drA), "events for P1")
+
+    # Unauthorized read (should raise)
+    try:
+        hc.get_patient_events("InsurerY","P1")
+    except PermissionError as e:
+        print("View blocked:", e)
+
+    print("Chain valid?", hc.is_valid())
+    print("Audit entries:", len(hc.audit_log))
